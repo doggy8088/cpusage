@@ -63,10 +63,14 @@ interface LogEvent {
 // Argument Parsing
 const args = process.argv.slice(2);
 const showHelp = args.includes('-h') || args.includes('--help');
+const listPrice = args.includes('--list-price');
 const rankByCost = args.includes('--rank');
+const jsonOutput = args.includes('--json');
 const verbose = args.includes('--verbose');
 const unitIndex = args.indexOf('--unit');
+const limitIndex = args.indexOf('--limit');
 let timeUnit: 'day' | 'month' | 'hour' = 'day';
+let limit = rankByCost ? 10 : Infinity; // Default limit for rank is 10
 
 if (unitIndex !== -1 && args[unitIndex + 1]) {
     const unitArg = args[unitIndex + 1].toLowerCase();
@@ -77,6 +81,16 @@ if (unitIndex !== -1 && args[unitIndex + 1]) {
     }
 }
 
+if (limitIndex !== -1 && args[limitIndex + 1]) {
+    const limitArg = parseInt(args[limitIndex + 1], 10);
+    if (!isNaN(limitArg) && limitArg > 1) {
+        limit = limitArg;
+    } else {
+        console.error(`Invalid limit: ${args[limitIndex + 1]}. Must be a number greater than 1.`);
+        process.exit(1);
+    }
+}
+
 if (showHelp) {
     console.log(`
 Usage: cpusage [options]
@@ -84,12 +98,25 @@ Usage: cpusage [options]
 Options:
   -h, --help       Show this help message
   --rank           Sort output by estimated cost (descending)
+  --limit <n>      Limit the number of results (default: 10 when using --rank)
   --unit <unit>    Aggregation unit: 'day' (default), 'month', or 'hour'
   --verbose        Show analysis details (log path and count)
+  --list-price     Show current pricing table
+  --json           Output results in JSON format
 
 Environment Variables:
   SESSION_DIR      Path to Copilot session logs (default: ~/.copilot/session-state)
 `);
+    process.exit(0);
+}
+
+if (listPrice) {
+    console.log('=== Current Pricing Table (USD per 1M tokens) ===');
+    console.log(`${'Model'.padEnd(25)} | ${'Input'.padEnd(10)} | ${'Output'.padEnd(10)}`);
+    console.log(`${'-'.repeat(25)}-|-${'-'.repeat(10)}-|-${'-'.repeat(10)}`);
+    for (const [model, pricing] of Object.entries(PRICING_TABLE)) {
+        console.log(`${model.padEnd(25)} | $${pricing.input.toFixed(2).padEnd(9)} | $${pricing.output.toFixed(2).padEnd(9)}`);
+    }
     process.exit(0);
 }
 function getAggregationKey(date: Date, unit: 'day' | 'month' | 'hour'): string {
@@ -205,6 +232,76 @@ async function analyzeFiles() {
         }
     }
 
+    // Fill gaps if not ranking by cost (show all dates in range)
+    if (!rankByCost && Object.keys(aggStats).length > 0) {
+        const keys = Object.keys(aggStats).sort();
+        const minKey = keys[0];
+        const maxKey = keys[keys.length - 1];
+
+        // Helper to parse key to Date object (local time)
+        const parseKeyToDate = (key: string): Date => {
+            if (timeUnit === 'month') {
+                const [y, m] = key.split('-').map(Number);
+                return new Date(y, m - 1, 1);
+            }
+            if (timeUnit === 'hour') {
+                const [dStr, tStr] = key.split(' ');
+                const [y, m, d] = dStr.split('-').map(Number);
+                const h = parseInt(tStr.split(':')[0], 10);
+                return new Date(y, m - 1, d, h);
+            }
+            // day
+            const [y, m, d] = key.split('-').map(Number);
+            return new Date(y, m - 1, d);
+        };
+
+        let currentKey = minKey;
+        let currentDate = parseKeyToDate(minKey);
+
+        while (currentKey < maxKey) {
+            // Increment
+            if (timeUnit === 'month') {
+                currentDate.setMonth(currentDate.getMonth() + 1);
+            } else if (timeUnit === 'hour') {
+                currentDate.setHours(currentDate.getHours() + 1);
+            } else {
+                currentDate.setDate(currentDate.getDate() + 1);
+            }
+
+            currentKey = getAggregationKey(currentDate, timeUnit);
+
+            // If we've gone past maxKey (should be caught by loop condition, but safe check)
+            if (currentKey > maxKey) break;
+
+            if (!aggStats[currentKey]) {
+                aggStats[currentKey] = { sessions: 0, input: 0, output: 0, cost: 0 };
+            }
+        }
+    }
+
+    let sortedKeys = Object.keys(aggStats);
+    if (rankByCost) {
+        sortedKeys.sort((a, b) => aggStats[b].cost - aggStats[a].cost);
+    } else {
+        sortedKeys.sort().reverse();
+    }
+
+    if (limit !== Infinity) {
+        sortedKeys = sortedKeys.slice(0, limit);
+    }
+
+    if (jsonOutput) {
+        const outputData = sortedKeys.map(key => ({
+            date: key,
+            sessions: aggStats[key].sessions,
+            input: aggStats[key].input,
+            output: aggStats[key].output,
+            cost: Number(aggStats[key].cost.toFixed(4))
+        }));
+        console.log(JSON.stringify(outputData, null, 2));
+        return;
+    }
+
     // Report
     console.log('\n=== GitHub Copilot Usage Analysis (Dynamic Pricing) ===');
     console.log(`Total Sessions: ${totalSessions}`);
@@ -220,13 +317,6 @@ async function analyzeFiles() {
     
     console.log(`${'Date'.padEnd(dateColWidth)} | Sessions | Input Tokens | Output Tokens | Est. Cost`);
     console.log(`${'-'.repeat(dateColWidth)}-|----------|--------------|---------------|----------`);
-    
-    let sortedKeys = Object.keys(aggStats);
-    if (rankByCost) {
-        sortedKeys.sort((a, b) => aggStats[b].cost - aggStats[a].cost);
-    } else {
-        sortedKeys.sort();
-    }
 
     for (const key of sortedKeys) {
         const stats = aggStats[key];

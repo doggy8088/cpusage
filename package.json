@@ -1,6 +1,6 @@
 {
   "name": "@willh/cpusage",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Analyze Copilot usage logs for cost estimation",
   "type": "module",
   "main": "dist/app.js",
@@ -11,7 +11,10 @@
     "start": "bun run src/app.ts",
     "build": "bun build ./src/app.ts --outdir ./dist --target node",
     "prepublishOnly": "bun run build",
-    "bump": "npm version patch"
+    "bump:patch": "npm version patch --no-git-tag-version",
+    "bump:minor": "npm version minor --no-git-tag-version",
+    "bump:major": "npm version major --no-git-tag-version",
+    "bump": "npm run bump:patch"
   },
   "keywords": [
     "copilot",
