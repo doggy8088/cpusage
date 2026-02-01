@@ -1,0 +1,30 @@
+{
+  "name": "@willh/cpusage",
+  "version": "1.0.0",
+  "description": "Analyze Copilot usage logs for cost estimation",
+  "main": "dist/app.js",
+  "bin": {
+    "cpusage": "dist/app.js"
+  },
+  "scripts": {
+    "start": "bun run src/app.ts",
+    "build": "bun build ./src/app.ts --outdir ./dist --target node",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": [
+    "copilot",
+    "usage",
+    "cost",
+    "analyzer"
+  ],
+  "author": "WillH",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "bun-types": "latest",
+    "typescript": "^5.0.0"
+  },
+  "files": [
+    "dist"
+  ]
+}

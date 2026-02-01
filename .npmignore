@@ -1,0 +1,6 @@
+src
+tsconfig.json
+.github
+.gitignore
+bun.lockb
+analyze_copilot_logs.js
