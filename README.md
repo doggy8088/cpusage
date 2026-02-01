@@ -1,4 +1,4 @@
-# Copilot Usage Analyzer (@willh/cpusage)
+# Copilot Usage Analyzer
 
 這是一個用於分析 GitHub Copilot 聊天記錄並估算成本的命令列工具。它會讀取本地的 Copilot Session Logs (.jsonl)，統計 Token 使用量，並根據模型定價表計算預估費用。
 
@@ -80,6 +80,4 @@ bun run build
 
 ## 授權
 
-ISC
-
-```
+MIT

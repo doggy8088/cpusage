@@ -10,7 +10,8 @@
   "scripts": {
     "start": "bun run src/app.ts",
     "build": "bun build ./src/app.ts --outdir ./dist --target node",
-    "prepublishOnly": "bun run build"
+    "prepublishOnly": "bun run build",
+    "bump": "npm version patch"
   },
   "keywords": [
     "copilot",
