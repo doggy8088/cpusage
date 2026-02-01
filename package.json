@@ -2,6 +2,7 @@
   "name": "@willh/cpusage",
   "version": "1.0.0",
   "description": "Analyze Copilot usage logs for cost estimation",
+  "type": "module",
   "main": "dist/app.js",
   "bin": {
     "cpusage": "dist/app.js"

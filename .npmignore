@@ -2,5 +2,8 @@ src
 tsconfig.json
 .github
 .gitignore
-bun.lockb
+bun.lock
+node_modules
 analyze_copilot_logs.js
+*.log
+.DS_Store
