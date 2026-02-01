@@ -18,8 +18,8 @@
     "cost",
     "analyzer"
   ],
-  "author": "WillH",
-  "license": "ISC",
+  "author": "Will 保哥",
+  "license": "MIT",
   "devDependencies": {
     "@types/node": "^20.0.0",
     "bun-types": "latest",
