@@ -54,9 +54,11 @@ interface LogEvent {
     type: string;
     data: {
         startTime?: string;
-        model?: string;
+        selectedMode?: string;
+        selectedModel?: string;
         postTruncationTokensInMessages?: number;
         content?: string;
+        transformedContent?: string;
     };
 }
 
@@ -130,6 +132,61 @@ function getAggregationKey(date: Date, unit: 'day' | 'month' | 'hour'): string {
     return `${yyyy}-${mm}-${dd}`;
 }
 
+function estimateTokensFromText(text: string | undefined): number {
+    if (!text) return 0;
+    // Rough heuristic: ~4 UTF-8 bytes per token.
+    return Math.ceil(Buffer.byteLength(text, 'utf8') / 4);
+}
+
+function normalizeModelName(model: string): string {
+    return model
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, '-')
+        .replace(/_/g, '-')
+        .replace(/[^a-z0-9.-]/g, '')
+        .replace(/-+/g, '-');
+}
+
+function findSessionLogFiles(sessionDir: string): string[] {
+    const eventsJsonl: string[] = [];
+    const topLevelJsonl: string[] = [];
+    const stack: string[] = [sessionDir];
+
+    while (stack.length > 0) {
+        const currentDir = stack.pop() as string;
+        let entries: fs.Dirent[];
+        try {
+            entries = fs.readdirSync(currentDir, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+
+        for (const entry of entries) {
+            const fullPath = path.join(currentDir, entry.name);
+
+            if (entry.isDirectory()) {
+                stack.push(fullPath);
+                continue;
+            }
+
+            if (!entry.isFile()) continue;
+
+            if (entry.name === 'events.jsonl') {
+                eventsJsonl.push(fullPath);
+                continue;
+            }
+
+            // Back-compat: older setups may store .jsonl directly under SESSION_DIR.
+            if (currentDir === sessionDir && entry.name.endsWith('.jsonl')) {
+                topLevelJsonl.push(fullPath);
+            }
+        }
+    }
+
+    return eventsJsonl.length > 0 ? eventsJsonl : topLevelJsonl;
+}
+
 async function analyzeFiles() {
     if (!fs.existsSync(SESSION_DIR)) {
         console.error(`Directory not found: ${SESSION_DIR}`);
@@ -137,10 +194,13 @@ async function analyzeFiles() {
         process.exit(1);
     }
 
-    const files = fs.readdirSync(SESSION_DIR).filter(f => f.endsWith('.jsonl'));
+    const files = findSessionLogFiles(SESSION_DIR);
     if (verbose) {
         console.log(`Analyzing logs from: ${SESSION_DIR}`);
         console.log(`Found ${files.length} session logs.`);
+        if (files.length > 0) {
+            console.log(`Sample log: ${files[0]}`);
+        }
     }
 
     let totalSessions = 0;
@@ -149,8 +209,7 @@ async function analyzeFiles() {
     let totalCost = 0;
     const aggStats: Record<string, DailyStats> = {};
 
-    for (const file of files) {
-        const filePath = path.join(SESSION_DIR, file);
+    for (const filePath of files) {
         const fileStream = fs.createReadStream(filePath);
         const rl = readline.createInterface({
             input: fileStream,
@@ -158,7 +217,8 @@ async function analyzeFiles() {
         });
 
         let sessionDateObj: Date | null = null;
-        let sessionInputTokens = 0;
+        let sessionInputTokensFromMessages = 0;
+        let sessionInputTokensFromTruncationMax = 0;
         let sessionOutputTokens = 0;
         let sessionModel = 'default'; // Default model
 
@@ -172,31 +232,47 @@ async function analyzeFiles() {
                     sessionDateObj = new Date(event.data.startTime);
                     
                     // Attempt to find model in session.start (if ever added)
-                    if (event.data.model) {
-                        sessionModel = event.data.model;
-                    }
+                    sessionModel = event.data.selectedModel || event.data.selectedMode || sessionModel;
                 }
 
                 // Check other events for model info (just in case)
-                if (event.type === 'session.info' && event.data.model) {
-                    sessionModel = event.data.model;
+                if (event.type === 'session.info') {
+                    sessionModel = event.data.selectedModel || event.data.selectedMode || sessionModel;
                 }
 
-                // Input Tokens
+                // Input Tokens (estimate)
+                if (event.type === 'user.message') {
+                    const content = event.data.transformedContent || event.data.content || '';
+                    sessionInputTokensFromMessages += estimateTokensFromText(content);
+                }
+
+                // Input Tokens (if present in logs, treat as more authoritative than heuristics)
                 if (event.type === 'session.truncation') {
-                    sessionInputTokens += (event.data.postTruncationTokensInMessages || 0);
+                    sessionInputTokensFromTruncationMax = Math.max(
+                        sessionInputTokensFromTruncationMax,
+                        event.data.postTruncationTokensInMessages || 0
+                    );
                 }
 
                 // Output Tokens
                 if (event.type === 'assistant.message') {
-                    const content = event.data.content || "";
-                    sessionOutputTokens += Math.ceil(content.length / 4);
+                    sessionOutputTokens += estimateTokensFromText(event.data.content || '');
+                }
+
+                // Some logs store assistant reasoning separately.
+                if (event.type === 'assistant.reasoning') {
+                    sessionOutputTokens += estimateTokensFromText(event.data.content || '');
                 }
 
             } catch (e) {
                 // Ignore parse errors
             }
         }
+
+        const sessionInputTokens =
+            sessionInputTokensFromTruncationMax > 0
+                ? sessionInputTokensFromTruncationMax
+                : sessionInputTokensFromMessages;
 
         if (sessionDateObj) {
             totalSessions++;
@@ -207,7 +283,7 @@ async function analyzeFiles() {
             let pricing = PRICING_TABLE[sessionModel] || PRICING_TABLE['default'];
             
             // Normalize model name check (case insensitive)
-            const normalizedModel = sessionModel.toLowerCase();
+            const normalizedModel = normalizeModelName(sessionModel);
             for (const key of Object.keys(PRICING_TABLE)) {
                 if (normalizedModel.includes(key)) {
                     pricing = PRICING_TABLE[key];
