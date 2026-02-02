@@ -56,6 +56,7 @@ interface LogEvent {
         startTime?: string;
         selectedMode?: string;
         selectedModel?: string;
+        model?: string;
         postTruncationTokensInMessages?: number;
         content?: string;
         transformedContent?: string;
@@ -177,14 +178,14 @@ function findSessionLogFiles(sessionDir: string): string[] {
                 continue;
             }
 
-            // Back-compat: older setups may store .jsonl directly under SESSION_DIR.
-            if (currentDir === sessionDir && entry.name.endsWith('.jsonl')) {
+            // Treat any other .jsonl file as a standalone session log, regardless of directory depth
+            if (entry.name.endsWith('.jsonl')) {
                 topLevelJsonl.push(fullPath);
             }
         }
     }
 
-    return eventsJsonl.length > 0 ? eventsJsonl : topLevelJsonl;
+    return [...topLevelJsonl, ...eventsJsonl];
 }
 
 async function analyzeFiles() {
@@ -218,7 +219,7 @@ async function analyzeFiles() {
 
         let sessionDateObj: Date | null = null;
         let sessionInputTokensFromMessages = 0;
-        let sessionInputTokensFromTruncationMax = 0;
+        let sessionInputTokensFromTruncationSum = 0;
         let sessionOutputTokens = 0;
         let sessionModel = 'default'; // Default model
 
@@ -232,12 +233,12 @@ async function analyzeFiles() {
                     sessionDateObj = new Date(event.data.startTime);
                     
                     // Attempt to find model in session.start (if ever added)
-                    sessionModel = event.data.selectedModel || event.data.selectedMode || sessionModel;
+                    sessionModel = event.data.selectedModel || event.data.selectedMode || event.data.model || sessionModel;
                 }
 
                 // Check other events for model info (just in case)
                 if (event.type === 'session.info') {
-                    sessionModel = event.data.selectedModel || event.data.selectedMode || sessionModel;
+                    sessionModel = event.data.selectedModel || event.data.selectedMode || event.data.model || sessionModel;
                 }
 
                 // Input Tokens (estimate)
@@ -248,10 +249,7 @@ async function analyzeFiles() {
 
                 // Input Tokens (if present in logs, treat as more authoritative than heuristics)
                 if (event.type === 'session.truncation') {
-                    sessionInputTokensFromTruncationMax = Math.max(
-                        sessionInputTokensFromTruncationMax,
-                        event.data.postTruncationTokensInMessages || 0
-                    );
+                    sessionInputTokensFromTruncationSum += (event.data.postTruncationTokensInMessages || 0);
                 }
 
                 // Output Tokens
@@ -270,8 +268,8 @@ async function analyzeFiles() {
         }
 
         const sessionInputTokens =
-            sessionInputTokensFromTruncationMax > 0
-                ? sessionInputTokensFromTruncationMax
+            sessionInputTokensFromTruncationSum > 0
+                ? sessionInputTokensFromTruncationSum
                 : sessionInputTokensFromMessages;
 
         if (sessionDateObj) {
