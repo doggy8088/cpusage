@@ -1,10 +1,10 @@
 # Copilot Usage Analyzer
 
-A command-line tool for analyzing GitHub Copilot chat logs and estimating costs. It reads local Copilot Session Logs (.jsonl), counts token usage, and calculates estimated costs based on a model pricing table.
+A command-line tool for analyzing GitHub Copilot chat logs and estimating costs. It reads local Copilot Session Logs (.jsonl) and usage entries from `~/.copilot/logs`, prefers usage token totals, and falls back to session-state estimates when usage data is unavailable.
 
 ## Features
 
-- **Auto-detection**: Defaults to reading Copilot logs from the user's home directory (`~/.copilot/session-state`).
+- **Auto-detection**: Reads usage entries from `~/.copilot/logs` and Copilot logs from the user's home directory (`~/.copilot/session-state`), and falls back to session-state estimates when usage data is unavailable.
 - **Multi-model Pricing Support**: Includes estimated pricing for GPT-5, GPT-4, Claude, and more.
 - **Flexible Aggregation**: Supports aggregation by day, month, or hour.
 - **Ranking & Filtering**: Sort by cost and limit the number of results.

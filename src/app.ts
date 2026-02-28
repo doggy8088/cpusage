@@ -7,6 +7,13 @@ import os from 'node:os';
 // Configuration
 // Default to HOME/.copilot/session-state if not provided in env
 const SESSION_DIR = process.env.SESSION_DIR || path.join(os.homedir(), '.copilot', 'session-state');
+const LOG_DIR = path.join(os.homedir(), '.copilot', 'logs');
+
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_LOG_FILE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.log$/i;
+const PROCESS_LOG_FILE_PATTERN = /^process-.*\.log$/i;
+const LOG_PREFIX_PATTERN = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)\s+\[[^\]]+\]\s?(.*)$/;
+const SESSION_CONTEXT_PATTERN = /\b(?:session|Workspace initialized:)\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/i;
 
 interface Pricing {
     input: number;
@@ -54,6 +61,7 @@ interface LogEvent {
     type: string;
     data: {
         startTime?: string;
+        sessionId?: string;
         selectedMode?: string;
         selectedModel?: string;
         model?: string;
@@ -61,6 +69,28 @@ interface LogEvent {
         content?: string;
         transformedContent?: string;
     };
+}
+
+interface SessionUsage {
+    date: Date;
+    inputTokens: number;
+    outputTokens: number;
+    model: string;
+}
+
+interface LogSessionUsage {
+    inputTokens: number;
+    outputTokens: number;
+    model: string;
+    timestamp: Date | null;
+}
+
+interface ParsedUsageRecord {
+    promptTokens: number;
+    completionTokens: number;
+    responseId: string | null;
+    sessionId: string | null;
+    model: string | null;
 }
 
 // Argument Parsing
@@ -149,6 +179,19 @@ function normalizeModelName(model: string): string {
         .replace(/-+/g, '-');
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null;
+}
+
+function inferSessionIdFromSessionFile(filePath: string): string {
+    const fileName = path.basename(filePath);
+    if (fileName === 'events.jsonl') {
+        return path.basename(path.dirname(filePath));
+    }
+
+    return fileName.replace(/\.jsonl$/i, '');
+}
+
 function findSessionLogFiles(sessionDir: string): string[] {
     const eventsJsonl: string[] = [];
     const topLevelJsonl: string[] = [];
@@ -188,17 +231,201 @@ function findSessionLogFiles(sessionDir: string): string[] {
     return [...topLevelJsonl, ...eventsJsonl];
 }
 
+function findCopilotUsageLogFiles(logDir: string): string[] {
+    if (!fs.existsSync(logDir)) {
+        return [];
+    }
+
+    let entries: fs.Dirent[];
+    try {
+        entries = fs.readdirSync(logDir, { withFileTypes: true });
+    } catch {
+        return [];
+    }
+
+    const processLogs: string[] = [];
+    const uuidLogs: string[] = [];
+
+    for (const entry of entries) {
+        if (!entry.isFile()) continue;
+
+        if (PROCESS_LOG_FILE_PATTERN.test(entry.name)) {
+            processLogs.push(path.join(logDir, entry.name));
+            continue;
+        }
+
+        if (UUID_LOG_FILE_PATTERN.test(entry.name)) {
+            uuidLogs.push(path.join(logDir, entry.name));
+        }
+    }
+
+    processLogs.sort();
+    uuidLogs.sort();
+
+    return [...processLogs, ...uuidLogs];
+}
+
+function extractUsageFromResponsePayload(payload: unknown): ParsedUsageRecord | null {
+    if (!isRecord(payload)) return null;
+
+    const usage = payload.usage;
+    if (!isRecord(usage)) return null;
+
+    const promptTokens = usage.prompt_tokens;
+    const completionTokens = usage.completion_tokens;
+    if (typeof promptTokens !== 'number' || typeof completionTokens !== 'number') return null;
+
+    const responseId = typeof payload.id === 'string'
+        ? payload.id
+        : (typeof payload.responseId === 'string' ? payload.responseId : null);
+    const sessionIdValue = payload.sessionId ?? payload.session_id;
+    const sessionId = typeof sessionIdValue === 'string' ? sessionIdValue : null;
+    const model = typeof payload.model === 'string' ? payload.model : null;
+
+    return {
+        promptTokens,
+        completionTokens,
+        responseId,
+        sessionId,
+        model
+    };
+}
+
+async function analyzeUsageLogFiles(logFiles: string[]): Promise<Map<string, LogSessionUsage>> {
+    const usageBySession = new Map<string, LogSessionUsage>();
+    const seenUsageBySessionAndResponse = new Set<string>();
+
+    for (const filePath of logFiles) {
+        const fileName = path.basename(filePath);
+        const fileSessionId = UUID_LOG_FILE_PATTERN.test(fileName) ? fileName.replace(/\.log$/i, '') : null;
+        let currentSessionId: string | null = fileSessionId;
+        let jsonBuffer: string[] | null = null;
+        let jsonBufferSessionId: string | null = null;
+        let jsonBufferTimestamp: Date | null = null;
+
+        const finalizeJsonBuffer = () => {
+            if (!jsonBuffer) return;
+
+            const jsonText = jsonBuffer.join('\n').trim();
+            const contextSessionId = jsonBufferSessionId;
+            const contextTimestamp = jsonBufferTimestamp;
+            jsonBuffer = null;
+            jsonBufferSessionId = null;
+            jsonBufferTimestamp = null;
+
+            if (!jsonText) return;
+
+            let payload: unknown;
+            try {
+                payload = JSON.parse(jsonText);
+            } catch {
+                return;
+            }
+
+            const usageRecord = extractUsageFromResponsePayload(payload);
+            if (!usageRecord) return;
+
+            const sessionId = usageRecord.sessionId || contextSessionId || fileSessionId;
+            if (!sessionId || !UUID_PATTERN.test(sessionId)) return;
+
+            if (usageRecord.responseId) {
+                const dedupeKey = `${sessionId}:${usageRecord.responseId}`;
+                if (seenUsageBySessionAndResponse.has(dedupeKey)) {
+                    return;
+                }
+                seenUsageBySessionAndResponse.add(dedupeKey);
+            }
+
+            const existing = usageBySession.get(sessionId);
+            if (existing) {
+                existing.inputTokens += usageRecord.promptTokens;
+                existing.outputTokens += usageRecord.completionTokens;
+                if (existing.model === 'default' && usageRecord.model) {
+                    existing.model = usageRecord.model;
+                }
+                if (contextTimestamp && (!existing.timestamp || contextTimestamp < existing.timestamp)) {
+                    existing.timestamp = contextTimestamp;
+                }
+            } else {
+                usageBySession.set(sessionId, {
+                    inputTokens: usageRecord.promptTokens,
+                    outputTokens: usageRecord.completionTokens,
+                    model: usageRecord.model || 'default',
+                    timestamp: contextTimestamp
+                });
+            }
+        };
+
+        const fileStream = fs.createReadStream(filePath);
+        const rl = readline.createInterface({
+            input: fileStream,
+            crlfDelay: Infinity
+        });
+
+        for await (const line of rl) {
+            const prefixMatch = line.match(LOG_PREFIX_PATTERN);
+
+            if (jsonBuffer && prefixMatch) {
+                finalizeJsonBuffer();
+            }
+
+            if (!prefixMatch) {
+                if (jsonBuffer) {
+                    jsonBuffer.push(line);
+                }
+                continue;
+            }
+
+            const payloadLine = prefixMatch[2] || '';
+            const sessionMatch = payloadLine.match(SESSION_CONTEXT_PATTERN);
+            if (sessionMatch) {
+                currentSessionId = sessionMatch[1];
+            }
+
+            if (!jsonBuffer && payloadLine.trimStart().startsWith('{')) {
+                const timestamp = new Date(prefixMatch[1]);
+                jsonBuffer = [payloadLine];
+                jsonBufferSessionId = currentSessionId;
+                jsonBufferTimestamp = Number.isNaN(timestamp.getTime()) ? null : timestamp;
+            }
+        }
+
+        if (jsonBuffer) {
+            finalizeJsonBuffer();
+        }
+    }
+
+    return usageBySession;
+}
+
 async function analyzeFiles() {
-    if (!fs.existsSync(SESSION_DIR)) {
-        console.error(`Directory not found: ${SESSION_DIR}`);
+    const hasSessionDir = fs.existsSync(SESSION_DIR);
+    const hasLogDir = fs.existsSync(LOG_DIR);
+
+    if (!hasSessionDir && !hasLogDir) {
+        console.error(`Directory not found: ${SESSION_DIR} or ${LOG_DIR}`);
         console.error(`Please check if Copilot logs exist or set SESSION_DIR environment variable.`);
         process.exit(1);
     }
 
-    const files = findSessionLogFiles(SESSION_DIR);
+    const files = hasSessionDir ? findSessionLogFiles(SESSION_DIR) : [];
+    const usageLogFiles = hasLogDir ? findCopilotUsageLogFiles(LOG_DIR) : [];
+    const usageFromLogsBySession = await analyzeUsageLogFiles(usageLogFiles);
+
     if (verbose) {
-        console.log(`Analyzing logs from: ${SESSION_DIR}`);
-        console.log(`Found ${files.length} session logs.`);
+        if (hasSessionDir) {
+            console.log(`Analyzing logs from: ${SESSION_DIR}`);
+            console.log(`Found ${files.length} session logs.`);
+        } else {
+            console.log(`Session-state directory not found: ${SESSION_DIR}`);
+        }
+        if (hasLogDir) {
+            console.log(`Analyzing usage logs from: ${LOG_DIR}`);
+            console.log(`Found ${usageLogFiles.length} usage logs.`);
+        } else {
+            console.log(`Usage log directory not found: ${LOG_DIR}`);
+        }
+        console.log(`Found usage totals for ${usageFromLogsBySession.size} sessions from usage logs.`);
         if (files.length > 0) {
             console.log(`Sample log: ${files[0]}`);
         }
@@ -209,6 +436,39 @@ async function analyzeFiles() {
     let totalOutputTokens = 0;
     let totalCost = 0;
     const aggStats: Record<string, DailyStats> = {};
+    const sessionStateUsage = new Map<string, SessionUsage>();
+
+    const addSessionUsage = (sessionDateObj: Date, sessionInputTokens: number, sessionOutputTokens: number, sessionModel: string) => {
+        totalSessions++;
+        totalInputTokens += sessionInputTokens;
+        totalOutputTokens += sessionOutputTokens;
+
+        // Determine pricing for this session
+        let pricing = PRICING_TABLE[sessionModel] || PRICING_TABLE['default'];
+
+        // Normalize model name check (case insensitive)
+        const normalizedModel = normalizeModelName(sessionModel);
+        for (const key of Object.keys(PRICING_TABLE)) {
+            if (normalizedModel.includes(key)) {
+                pricing = PRICING_TABLE[key];
+                break;
+            }
+        }
+
+        const sessionCost = (sessionInputTokens / 1_000_000 * pricing.input) +
+                            (sessionOutputTokens / 1_000_000 * pricing.output);
+
+        totalCost += sessionCost;
+
+        const aggKey = getAggregationKey(sessionDateObj, timeUnit);
+        if (!aggStats[aggKey]) {
+            aggStats[aggKey] = { sessions: 0, input: 0, output: 0, cost: 0 };
+        }
+        aggStats[aggKey].sessions++;
+        aggStats[aggKey].input += sessionInputTokens;
+        aggStats[aggKey].output += sessionOutputTokens;
+        aggStats[aggKey].cost += sessionCost;
+    };
 
     for (const filePath of files) {
         const fileStream = fs.createReadStream(filePath);
@@ -218,6 +478,7 @@ async function analyzeFiles() {
         });
 
         let sessionDateObj: Date | null = null;
+        let sessionId = inferSessionIdFromSessionFile(filePath);
         let sessionInputTokensFromMessages = 0;
         let sessionInputTokensFromTruncationSum = 0;
         let sessionOutputTokens = 0;
@@ -231,6 +492,9 @@ async function analyzeFiles() {
                 // Get Session Date
                 if (event.type === 'session.start' && event.data.startTime) {
                     sessionDateObj = new Date(event.data.startTime);
+                    if (event.data.sessionId) {
+                        sessionId = event.data.sessionId;
+                    }
                     
                     // Attempt to find model in session.start (if ever added)
                     sessionModel = event.data.selectedModel || event.data.selectedMode || event.data.model || sessionModel;
@@ -272,38 +536,59 @@ async function analyzeFiles() {
                 ? sessionInputTokensFromTruncationSum
                 : sessionInputTokensFromMessages;
 
-        if (sessionDateObj) {
-            totalSessions++;
-            totalInputTokens += sessionInputTokens;
-            totalOutputTokens += sessionOutputTokens;
-
-            // Determine pricing for this session
-            let pricing = PRICING_TABLE[sessionModel] || PRICING_TABLE['default'];
-            
-            // Normalize model name check (case insensitive)
-            const normalizedModel = normalizeModelName(sessionModel);
-            for (const key of Object.keys(PRICING_TABLE)) {
-                if (normalizedModel.includes(key)) {
-                    pricing = PRICING_TABLE[key];
-                    break;
+        if (sessionDateObj && !Number.isNaN(sessionDateObj.getTime())) {
+            const existingSession = sessionStateUsage.get(sessionId);
+            if (existingSession) {
+                existingSession.inputTokens += sessionInputTokens;
+                existingSession.outputTokens += sessionOutputTokens;
+                if (existingSession.model === 'default' && sessionModel !== 'default') {
+                    existingSession.model = sessionModel;
                 }
+                if (sessionDateObj < existingSession.date) {
+                    existingSession.date = sessionDateObj;
+                }
+            } else {
+                sessionStateUsage.set(sessionId, {
+                    date: sessionDateObj,
+                    inputTokens: sessionInputTokens,
+                    outputTokens: sessionOutputTokens,
+                    model: sessionModel
+                });
             }
-
-            const sessionCost = (sessionInputTokens / 1_000_000 * pricing.input) + 
-                                (sessionOutputTokens / 1_000_000 * pricing.output);
-            
-            totalCost += sessionCost;
-
-            const aggKey = getAggregationKey(sessionDateObj, timeUnit);
-
-            if (!aggStats[aggKey]) {
-                aggStats[aggKey] = { sessions: 0, input: 0, output: 0, cost: 0 };
-            }
-            aggStats[aggKey].sessions++;
-            aggStats[aggKey].input += sessionInputTokens;
-            aggStats[aggKey].output += sessionOutputTokens;
-            aggStats[aggKey].cost += sessionCost;
         }
+    }
+
+    const sessionIdsFromState = new Set<string>();
+    for (const [sessionId, usage] of sessionStateUsage.entries()) {
+        const usageFromLogs = usageFromLogsBySession.get(sessionId);
+        if (usageFromLogs) {
+            addSessionUsage(
+                usage.date,
+                usageFromLogs.inputTokens,
+                usageFromLogs.outputTokens,
+                usageFromLogs.model || usage.model
+            );
+        } else {
+            addSessionUsage(
+                usage.date,
+                usage.inputTokens,
+                usage.outputTokens,
+                usage.model
+            );
+        }
+        sessionIdsFromState.add(sessionId);
+    }
+
+    for (const [sessionId, usageFromLogs] of usageFromLogsBySession.entries()) {
+        if (sessionIdsFromState.has(sessionId)) continue;
+        if (!usageFromLogs.timestamp) continue;
+
+        addSessionUsage(
+            usageFromLogs.timestamp,
+            usageFromLogs.inputTokens,
+            usageFromLogs.outputTokens,
+            usageFromLogs.model
+        );
     }
 
     // Fill gaps if not ranking by cost (show all dates in range)

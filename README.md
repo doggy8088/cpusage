@@ -1,10 +1,10 @@
 # Copilot Usage Analyzer
 
-這是一個用於分析 GitHub Copilot 聊天記錄並估算成本的命令列工具。它會讀取本地的 Copilot Session Logs (.jsonl)，統計 Token 使用量，並根據模型定價表計算預估費用。
+這是一個用於分析 GitHub Copilot 聊天記錄並估算成本的命令列工具。它會讀取本地的 Copilot Session Logs (.jsonl) 與 `~/.copilot/logs` 的 usage 記錄，優先使用 usage Token，若 usage 不可用則回退為 session-state 估算，並根據模型定價表計算預估費用。
 
 ## 特色
 
-- **自動偵測路徑**：預設讀取使用者家目錄下的 Copilot 記錄檔 (`~/.copilot/session-state`)。
+- **自動偵測路徑**：預設讀取使用者家目錄下的 `~/.copilot/logs` usage 記錄與 Copilot 記錄檔 (`~/.copilot/session-state`)，若 usage 不可用則回退為 session-state 估算。
 - **支援多種模型計價**：包含 GPT-5, GPT-4, Claude 等模型的預估價格。
 - **靈活統計**：支援按日、月、小時進行統計。
 - **排名與過濾**：可根據成本排序，並限制顯示筆數。
